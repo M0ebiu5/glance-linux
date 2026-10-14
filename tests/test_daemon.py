@@ -17,6 +17,7 @@ import pytest
 
 from glanced import ipc, paths
 from glanced import store as store_module
+from glanced import vault as vault_module
 from glanced.daemon import Daemon, Session
 from glanced.pipeline import Outcome
 
@@ -52,7 +53,9 @@ def _exploding_processor():
 def daemon(scratch):
     store_path = scratch / "enrollment.bin"
     _enrolled_store(store_path)
-    instance = Daemon(store_path=store_path, processor_factory=_exploding_processor)
+    instance = Daemon(
+        store_path=store_path, vault_path=scratch / "vault.bin", processor_factory=_exploding_processor
+    )
     thread = threading.Thread(target=instance.serve, daemon=True)
     thread.start()
     deadline = time.monotonic() + 5
@@ -201,3 +204,107 @@ def test_lockout_can_be_disabled(scratch):
     d = _scripted_daemon(scratch, [Outcome.NO_MATCH] * 20, max_failures=0)
     for _ in range(20):
         assert d.run_scan().outcome is Outcome.NO_MATCH
+
+
+# --- autotype -----------------------------------------------------------
+#
+# What matters here is the same thing that matters for `authenticate`: an
+# answer the camera was never asked for (nothing saved, or more than one
+# candidate with no id to pick between them) must not touch it, and an
+# answer that could reveal a secret must go through the real scan path —
+# `_exploding_processor` (see above) turns "the camera was touched" into a
+# `CameraTouched` reason on an `Outcome.ERROR` result.
+
+
+def _arm_with_vault(daemon_instance, entries):
+    ipc.request(ipc.AUTH_SOCKET, "arm", {"passphrase": "hunter2"})
+    daemon_instance.vault = vault_module.VaultStore(entries=list(entries))
+
+
+def test_autotype_unarmed_never_touches_camera(daemon):
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": ""})
+    assert not response.ok
+    assert response.payload["outcome"] == Outcome.NOT_ARMED.value
+    assert daemon.last_scan is None
+
+
+def test_autotype_no_match_never_touches_camera(daemon):
+    _arm_with_vault(daemon, [])
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": ""})
+    assert response.ok
+    assert response.payload == {"found": False}
+    assert daemon.last_scan is None
+
+
+def test_autotype_single_match_reaches_the_hardware(daemon):
+    entry = vault_module.new_entry(window_class="firefox", secret="s3cr3t")
+    _arm_with_vault(daemon, [entry])
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": ""})
+    assert not response.ok
+    assert response.payload["outcome"] == Outcome.ERROR.value
+    assert "CameraTouched" in response.payload["reason"]
+
+
+def test_autotype_ambiguous_never_touches_camera(daemon):
+    # Two saved logins whose title hint both match the current window (a
+    # shared word, or two entries nobody bothered to tell apart) — genuinely
+    # ambiguous, so neither is handed back without asking.
+    a = vault_module.new_entry(window_class="firefox", title_hint="Google", label="work", secret="a")
+    b = vault_module.new_entry(window_class="firefox", title_hint="Google", label="personal", secret="b")
+    _arm_with_vault(daemon, [a, b])
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": "Google - Firefox"})
+    assert response.ok
+    assert response.payload["found"] is True
+    assert {c["id"] for c in response.payload["ambiguous"]} == {a.id, b.id}
+    assert daemon.last_scan is None
+
+
+def test_autotype_unmatched_title_is_not_found(daemon):
+    # Every saved entry for this class said what site it's for; a window
+    # that matches none of them is a different, unsaved site.
+    a = vault_module.new_entry(window_class="firefox", title_hint="GitHub", label="GitHub", secret="a")
+    b = vault_module.new_entry(window_class="firefox", title_hint="Gmail", label="Gmail", secret="b")
+    _arm_with_vault(daemon, [a, b])
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": "New Tab"})
+    assert response.ok
+    assert response.payload == {"found": False}
+    assert daemon.last_scan is None
+
+
+def test_autotype_entry_id_disambiguates_and_reaches_hardware(daemon):
+    a = vault_module.new_entry(window_class="firefox", title_hint="GitHub", label="GitHub", secret="a")
+    b = vault_module.new_entry(window_class="firefox", title_hint="Gmail", label="Gmail", secret="b")
+    _arm_with_vault(daemon, [a, b])
+    response = ipc.request(
+        ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": "New Tab", "entryId": b.id}
+    )
+    assert not response.ok
+    assert response.payload["outcome"] == Outcome.ERROR.value
+    assert "CameraTouched" in response.payload["reason"]
+
+
+def test_autotype_unknown_entry_id_is_not_found(daemon):
+    _arm_with_vault(daemon, [vault_module.new_entry(window_class="firefox", secret="a")])
+    response = ipc.request(
+        ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": "", "entryId": "nope"}
+    )
+    assert response.ok
+    assert response.payload == {"found": False}
+    assert daemon.last_scan is None
+
+
+def test_disarm_clears_the_vault(daemon):
+    _arm_with_vault(daemon, [vault_module.new_entry(window_class="firefox", secret="a")])
+    ipc.request(ipc.AUTH_SOCKET, "disarm")
+    response = ipc.request(ipc.AUTH_SOCKET, "autotype", {"windowClass": "firefox", "windowTitle": ""})
+    assert not response.ok
+    assert response.payload["outcome"] == Outcome.NOT_ARMED.value
+
+
+def test_status_reports_vault_entry_count(daemon):
+    _arm_with_vault(
+        daemon,
+        [vault_module.new_entry(window_class="firefox", secret="a"), vault_module.new_entry(window_class="foot", secret="b")],
+    )
+    status = ipc.request(ipc.STATUS_SOCKET, "status").payload
+    assert status["vault"] == {"entries": 2}

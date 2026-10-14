@@ -60,6 +60,7 @@ the shell's own lock have, but one you should read before relying on it.
 | Attention mode (`attention.sock`, `glancectl attention`) | Complete, tested — head pose for the desktop, see below |
 | Omarchy plugin (`plugin/`) | Bar widget + panel — see `plugin/README.md` |
 | Lock screen indicator (`patches/omarchy-lock-faceid/`) | Face ID-style capsule with a live camera view — a patch to Omarchy's lock plugin, applied by `glancectl setup-lock` and re-applied after `omarchy update` by a post-update hook |
+| Autotype (`glancectl autotype`, `vault.py`) | Complete, tested — optional, convenience only, see below |
 
 ## Install
 
@@ -185,6 +186,72 @@ subscribes to. Things that matter about it:
 - **Clients fail open.** Only `tracking` says anything about where you are
   looking. A client covering the screen treats every other state, and
   silence, as "come down".
+
+## Autotype (optional, convenience only)
+
+`glancectl autotype` runs a face+liveness scan and, if it succeeds, types a
+stored password into whatever window has focus — a global shortcut for
+low-value logins, not a security feature. **Read this whole section before
+using it.**
+
+This is the trade-off the rest of the project exists to avoid: a real,
+plaintext-equivalent password, stored on disk and typed by software, exactly
+what the README's [Why](#why) section calls out as upstream Glance's
+single most sensitive design choice. It is opt-in, off until you save your
+first entry, and scoped by design to things you'd shrug off if they leaked —
+never your email, your bank, or anything an attacker could pivot from. Put
+those through a real password manager instead.
+
+What it is:
+
+- **A second, separate encrypted file.** `~/.local/share/glance/vault.bin`,
+  same AES-256-GCM/scrypt format as `enrollment.bin`, under the *same*
+  passphrase — one secret to manage, not two — but its own file, so a
+  problem with one can never touch the other. See `vault.py`.
+- **Gated by the same scan as unlock.** Revealing a saved password requires
+  a fresh face+liveness pass through the identical `run_scan()` path
+  `authenticate` uses, sharing its lockout counter. Checking whether an
+  entry *exists* for a window never touches the camera; only handing back a
+  secret does.
+- **Matched by window class, scoped by title.** `hyprctl activewindow` gives
+  the class (e.g. `firefox`) as the primary key. An entry saved with a title
+  hint only autotypes when the current window's title contains it — this is
+  what lets several logins live under one window class, since a browser's
+  class is the same for every site it has open; an entry saved with no hint
+  matches any window of that class. Two entries whose hints both match (or
+  two with no hint at all) are genuinely ambiguous and you're asked to pick;
+  a window that matches none of your saved hints is treated as a site you
+  haven't saved yet, not a guess between unrelated ones. Hyprland only, for
+  now — see `window.py`.
+- **Typed by `wtype`**, Wayland's virtual-keyboard protocol — no root daemon,
+  unlike `ydotool`. The secret always goes over `wtype -`'s stdin, never as
+  an argument, so it never appears in `ps` or `/proc/<pid>/cmdline`.
+- **First use asks and remembers.** If nothing is saved for a window yet,
+  `glancectl autotype` opens a small window asking for the password (there is
+  no terminal — it runs from a keybind); it shows the detected window class
+  and title and lets you edit the title match before saving, since the raw
+  title (a page title, an unread count) is often not the substring you want
+  to match on later. `glancectl vault add/list/remove` manage entries by hand
+  from a terminal; `list` never prints a secret.
+
+Wire it up with a keybind in `~/.config/hypr/bindings.lua` (Omarchy's own
+convention — see the comments already in that file):
+
+```lua
+o.bind("SUPER + A", "Glance autotype", "glancectl autotype")
+```
+
+Or, on a plain Hyprland config without Omarchy's `o.bind` wrapper:
+
+```
+bind = SUPER, A, exec, glancectl autotype
+```
+
+Check `hyprctl binds -j` before picking a key — Omarchy's defaults already
+claim most of the obvious ones.
+
+Not something this project does on its own: editing your compositor config is
+yours to do, and to remove.
 
 ## The liveness model
 

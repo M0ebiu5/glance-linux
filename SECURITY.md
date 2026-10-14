@@ -69,6 +69,28 @@ Moving the daemon and the enrollment store to a root-owned system service
 (the `fprintd` shape) is the fix, and is on the roadmap. It is a redesign,
 not a patch, so it is not in this release.
 
+### Autotype is a deliberate exception to all of the above
+
+`glancectl autotype` and `vault.py` store a real password and type it with
+software — the exact trade-off the rest of this document, and the README's
+[Why](README.md#why) section, exist to avoid. It is off until you save an
+entry, and it inherits every risk already described above (code running as
+you can read `vault.bin`'s passphrase the same way it can `enrollment.bin`'s;
+a spoofed or subverted daemon can hand back a stored secret the same way it
+can fake an unlock). It adds one new thing worth calling out on its own:
+
+- **The vault file is a standing target that did not exist before.**
+  `vault.bin` holds real credentials, encrypted at rest under the same
+  passphrase as your face template. Anyone who can run code as you and either
+  has that passphrase or can wait for an armed daemon can decrypt it — the
+  same "code already running as you" boundary as everywhere else in this
+  document, just now guarding something with resale value. Save only logins
+  you would not mind losing.
+- **Typing is not a new capability an attacker gains.** Any process already
+  running as you can run `wtype` itself; autotype does not expand what
+  keystroke injection can already do on this machine, only what triggers it
+  automatically.
+
 ### Residual risks you should know about
 
 - **Video replay.** A video of you on a screen can pass the confirm cues.

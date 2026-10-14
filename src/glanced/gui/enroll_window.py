@@ -48,7 +48,7 @@ from PySide6.QtGui import (
     QPen,
     QTransform,
 )
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from .. import poses
 from ..enroll import GuidedProgress, GuidedSession
@@ -529,7 +529,9 @@ def run(
     Raises on failure, so the CLI's error path is the same whether the window
     or the terminal drove the capture.
     """
-    app = QApplication.instance() or QApplication([])
+    from ._qt import app as _qapp
+
+    app = _qapp()
     window = EnrollmentWindow(
         name=name,
         device=device,

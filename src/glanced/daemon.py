@@ -29,6 +29,7 @@ from .preview import PreviewWriter
 from .liveness import LivenessMode
 from .pipeline import DEFAULT_SCAN_TIMEOUT, Outcome, ScanResult, UnlockPipeline
 from .store import EnrollmentStore, load as load_store
+from .vault import VaultStore, load as load_vault
 
 log = logging.getLogger("glanced")
 
@@ -90,6 +91,7 @@ class Daemon:
         mode: LivenessMode = LivenessMode.LIGHT,
         device: str = "/dev/video0",
         store_path: Path = paths.STORE_PATH,
+        vault_path: Path = paths.VAULT_PATH,
         scan_timeout: float = DEFAULT_SCAN_TIMEOUT,
         no_face_timeout: float = DEFAULT_NO_FACE_TIMEOUT,
         relock_after: Optional[float] = None,
@@ -105,6 +107,7 @@ class Daemon:
         self.mode = mode
         self.device = device
         self.store_path = Path(store_path)
+        self.vault_path = Path(vault_path)
         self.scan_timeout = scan_timeout
         self.no_face_timeout = no_face_timeout
         # Publishes camera frames for the lock screen's indicator to draw. Off
@@ -112,6 +115,10 @@ class Daemon:
         self.preview = preview
         self.session = Session(idle_timeout=relock_after)
         self.store = EnrollmentStore()
+        #: The autotype vault, decrypted alongside the enrollment store — see
+        #: `arm()`. Convenience feature, not a security boundary of its own;
+        #: see the "Autotype" section of the README.
+        self.vault = VaultStore()
         self.last_scan: Optional[dict[str, Any]] = None
         self.scanning = False
         self.max_failures = max_failures
@@ -139,16 +146,28 @@ class Daemon:
     # --- arming -------------------------------------------------------------
 
     def arm(self, passphrase: str) -> None:
-        """Decrypt the enrollment into memory. Raises on a wrong passphrase."""
+        """Decrypt the enrollment into memory. Raises on a wrong passphrase.
+
+        Also best-effort decrypts the autotype vault under the same
+        passphrase. A vault that does not exist yet, or fails to decrypt (a
+        different passphrase was used for it, or it is corrupt), never blocks
+        arming — it is a convenience feature riding on the real one."""
         store = load_store(passphrase, self.store_path)
+        try:
+            vault = load_vault(passphrase, self.vault_path)
+        except Exception:
+            log.warning("could not decrypt %s with this passphrase; autotype vault stays empty", self.vault_path)
+            vault = VaultStore()
         with self._lock:  # never swap the store out from under a running scan
             self.store = store
+            self.vault = vault
             self.session.unlock()
         log.info("armed with %d identit%s", len(store.identities), "y" if len(store.identities) == 1 else "ies")
 
     def disarm(self) -> None:
         with self._lock:
             self.store = EnrollmentStore()
+            self.vault = VaultStore()
             self.session.lock()
         log.info("disarmed")
 
@@ -256,7 +275,46 @@ class Daemon:
                 paths.PASSPHRASE_FILE.unlink(missing_ok=True)
             return ipc.Response(True, self._status_payload())
 
+        if request.verb == "autotype":
+            return self._autotype(request.payload)
+
         return ipc.Response(False, {"error": "unsupported verb"})
+
+    def _autotype(self, payload: dict[str, Any]) -> ipc.Response:
+        """Type a saved password into the window `payload` describes,
+        gated on the same scan `authenticate` runs.
+
+        Only a single candidate ever earns a scan: a window nothing is saved
+        for, or one with several saved entries and no `entryId` to pick
+        between them, is answered without touching the camera."""
+        if not self.session.armed:
+            return ipc.Response(
+                False, _describe(ScanResult(Outcome.NOT_ARMED, reason="Daemon is not armed. Run `glancectl arm`."))
+            )
+
+        entry_id = payload.get("entryId")
+        if entry_id:
+            entry = self.vault.get(entry_id)
+            matches = [entry] if entry else []
+        else:
+            matches = self.vault.find(payload.get("windowClass") or "", payload.get("windowTitle") or "")
+
+        if not matches:
+            return ipc.Response(True, {"found": False})
+        if len(matches) > 1:
+            return ipc.Response(
+                True, {"found": True, "ambiguous": [{"id": m.id, "label": m.label} for m in matches]}
+            )
+
+        with self._lock:
+            result = self.run_scan()
+        if result.outcome is not Outcome.UNLOCKED:
+            return ipc.Response(False, _describe(result))
+
+        entry = matches[0]
+        return ipc.Response(
+            True, {"found": True, "secret": entry.secret, "sendEnter": entry.send_enter, "label": entry.label}
+        )
 
     def _handle_status(self, request: ipc.Request) -> ipc.Response:
         """Presentation only. Nothing here can cause or influence an unlock."""
@@ -285,6 +343,7 @@ class Daemon:
                 for i in self.store.identities
             ],
             "lastScan": self.last_scan,
+            "vault": {"entries": len(self.vault.entries)},
         }
 
     # --- the scan -----------------------------------------------------------

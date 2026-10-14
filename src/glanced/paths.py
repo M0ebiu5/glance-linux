@@ -34,6 +34,10 @@ STORE_PATH = Path(os.environ.get("GLANCE_STORE") or DATA_DIR / "enrollment.bin")
 #: every login. Written only by `glancectl arm --remember`.
 PASSPHRASE_FILE = Path(os.environ.get("GLANCE_PASSPHRASE_FILE") or DATA_DIR / "passphrase")
 
+#: The autotype vault: application passwords, encrypted under the same
+#: passphrase as the enrollment store. See `vault.py` and `glancectl autotype`.
+VAULT_PATH = Path(os.environ.get("GLANCE_VAULT") or DATA_DIR / "vault.bin")
+
 LANDMARKER_NAME = "face_landmarker.task"
 ARCFACE_NAME = "arcface.onnx"
 

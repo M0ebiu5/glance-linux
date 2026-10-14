@@ -302,6 +302,253 @@ def _authenticate(args: argparse.Namespace) -> int:
     return 0 if response.ok else 1
 
 
+# --- autotype: a face scan that types a saved password into whatever window
+# has focus. Convenience only, not a security feature — see the "Autotype"
+# section of the README before saving anything you would mind being typed by
+# software. ------------------------------------------------------------------
+
+
+def _vault_passphrase(args: argparse.Namespace) -> str:
+    """The vault is encrypted under the same passphrase as the enrolled
+    face. Prefer a remembered one (the 0600 file `arm --remember` writes)
+    over prompting again — mainly for `glancectl autotype`, which is meant
+    to run from a hotkey with nobody there to type a second secret."""
+    path = paths.PASSPHRASE_FILE
+    if path.exists():
+        try:
+            if path.stat().st_mode & 0o077 == 0:
+                return path.read_text().rstrip("\n")
+        except OSError:
+            pass
+    print("This is the same passphrase you set for face enrollment.", file=sys.stderr)
+    return _read_passphrase(args)
+
+
+def _save_vault_entry(
+    args: argparse.Namespace, active, *, secret: str, label: str, title_hint: str, send_enter: bool
+) -> bool:
+    from . import vault as vault_module
+
+    passphrase = _vault_passphrase(args)
+    try:
+        store = vault_module.load(passphrase, paths.VAULT_PATH)
+    except Exception:
+        print("wrong passphrase" if paths.VAULT_PATH.exists() else "could not read the vault", file=sys.stderr)
+        return False
+    store.entries.append(
+        vault_module.new_entry(
+            window_class=active.window_class,
+            title_hint=title_hint[:80],
+            label=label,
+            secret=secret,
+            send_enter=send_enter,
+        )
+    )
+    vault_module.save(store, passphrase, paths.VAULT_PATH)
+    try:
+        ipc.request(ipc.AUTH_SOCKET, "arm", {"passphrase": passphrase}, timeout=5.0)
+    except (OSError, ConnectionError):
+        pass  # best-effort: a manual `glancectl arm` still picks it up
+    return True
+
+
+def _read_new_vault_entry(args: argparse.Namespace, active) -> Optional[tuple[str, str, str, bool]]:
+    """Prompt for a password to remember for `active`'s window class:
+    terminal or a window, the same rule `_read_passphrase` uses.
+
+    Returns `(secret, label, title_hint, send_enter)`. The title hint is
+    shown and editable, not silently captured — a window class alone is
+    often shared by every site in a browser, so the title is what tells a
+    saved login apart from the next one."""
+    if _prompts_in_a_window(args):
+        from .gui import ask_secret
+
+        return ask_secret(app_hint=active.window_class, window_title=active.title)
+    print(f"No saved password for '{active.window_class}' yet.", file=sys.stderr)
+    print(f"Window title: {active.title or '(none)'}", file=sys.stderr)
+    secret = getpass.getpass("Password to save: ")
+    if not secret:
+        print("empty password", file=sys.stderr)
+        return None
+    if getpass.getpass("Confirm password: ") != secret:
+        print("passwords do not match", file=sys.stderr)
+        return None
+    label = input(f"Label [{active.window_class}]: ").strip() or active.window_class
+    print(
+        "Only autotype when the title contains this (many apps share one window "
+        "class across every site — this is what tells them apart; leave blank to "
+        "match every window of this class):"
+    )
+    title_hint = input(f"Title contains [{active.title}]: ")
+    if not title_hint and active.title:
+        title_hint = active.title
+    send_enter = input("Press Enter after typing? [y/N] ").strip().lower().startswith("y")
+    return secret, label, title_hint.strip(), send_enter
+
+
+def _choose_vault_entry(args: argparse.Namespace, candidates: list[dict]) -> Optional[str]:
+    if _prompts_in_a_window(args):
+        from .gui import ask_choice
+
+        return ask_choice(
+            prompt="Several saved passwords match this window:",
+            options=[(c["id"], c["label"]) for c in candidates],
+        )
+    print("Several saved passwords match this window:", file=sys.stderr)
+    for index, candidate in enumerate(candidates, 1):
+        print(f"  {index}. {candidate['label']}", file=sys.stderr)
+    choice = input("Pick one: ").strip()
+    try:
+        return candidates[int(choice) - 1]["id"]
+    except (ValueError, IndexError):
+        print("invalid choice", file=sys.stderr)
+        return None
+
+
+def _autotype(args: argparse.Namespace) -> int:
+    from . import typewrite, window as window_module
+
+    active = window_module.active_window()
+    if active is None:
+        print("no focused window (is Hyprland running, and is something focused?)", file=sys.stderr)
+        return 1
+
+    def ask(payload: dict) -> ipc.Response:
+        return _daemon_request(
+            ipc.AUTH_SOCKET,
+            "autotype",
+            {**payload, "windowClass": active.window_class, "windowTitle": active.title},
+            timeout=60.0,
+        )
+
+    response = ask({})
+    payload = response.payload
+
+    if response.ok and payload.get("found") is False:
+        new_entry = _read_new_vault_entry(args, active)
+        if new_entry is None:
+            return 1
+        secret, label, title_hint, send_enter = new_entry
+        if not _save_vault_entry(
+            args, active, secret=secret, label=label, title_hint=title_hint, send_enter=send_enter
+        ):
+            return 1
+        response = ask({})
+        payload = response.payload
+
+    if response.ok and payload.get("ambiguous"):
+        chosen = _choose_vault_entry(args, payload["ambiguous"])
+        if chosen is None:
+            return 1
+        response = ask({"entryId": chosen})
+        payload = response.payload
+
+    if not response.ok:
+        text = OUTCOME_TEXT.get(payload.get("outcome"), payload.get("error") or payload.get("reason") or "failed")
+        print(text, file=sys.stderr)
+        return 1
+
+    try:
+        typewrite.type_text(payload["secret"], send_enter=bool(payload.get("sendEnter")))
+    except typewrite.TypingError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    return 0
+
+
+def _vault_add(args: argparse.Namespace) -> int:
+    from . import vault as vault_module
+
+    passphrase = _vault_passphrase(args)
+    try:
+        store = vault_module.load(passphrase, paths.VAULT_PATH)
+    except Exception:
+        print("wrong passphrase" if paths.VAULT_PATH.exists() else "could not read the vault", file=sys.stderr)
+        return 1
+    secret = getpass.getpass("Password to save: ")
+    if not secret:
+        print("empty password", file=sys.stderr)
+        return 1
+    if getpass.getpass("Confirm password: ") != secret:
+        print("passwords do not match", file=sys.stderr)
+        return 1
+    entry = vault_module.new_entry(
+        window_class=args.window_class,
+        title_hint=args.title_hint or "",
+        label=args.label or "",
+        secret=secret,
+        send_enter=args.enter,
+    )
+    store.entries.append(entry)
+    vault_module.save(store, passphrase, paths.VAULT_PATH)
+    try:
+        ipc.request(ipc.AUTH_SOCKET, "arm", {"passphrase": passphrase}, timeout=5.0)
+    except (OSError, ConnectionError):
+        pass
+    print(f"saved '{entry.label}' for window class '{entry.window_class}' ({entry.id})")
+    return 0
+
+
+def _vault_list(args: argparse.Namespace) -> int:
+    from . import vault as vault_module
+
+    if not paths.VAULT_PATH.exists():
+        print("[]" if args.json else "nothing saved")
+        return 0
+    passphrase = _vault_passphrase(args)
+    try:
+        store = vault_module.load(passphrase, paths.VAULT_PATH)
+    except Exception:
+        print("wrong passphrase", file=sys.stderr)
+        return 1
+    rows = [
+        {
+            "id": e.id,
+            "windowClass": e.window_class,
+            "titleHint": e.title_hint,
+            "label": e.label,
+            "sendEnter": e.send_enter,
+        }
+        for e in store.entries
+    ]
+    if args.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("nothing saved")
+        return 0
+    for row in rows:
+        hint = f" (title contains '{row['titleHint']}')" if row["titleHint"] else ""
+        print(f"{row['id']}  {row['windowClass']:<20} {row['label']}{hint}")
+    return 0
+
+
+def _vault_remove(args: argparse.Namespace) -> int:
+    from . import vault as vault_module
+
+    if not paths.VAULT_PATH.exists():
+        print("nothing saved", file=sys.stderr)
+        return 1
+    passphrase = _vault_passphrase(args)
+    try:
+        store = vault_module.load(passphrase, paths.VAULT_PATH)
+    except Exception:
+        print("wrong passphrase", file=sys.stderr)
+        return 1
+    before = len(store.entries)
+    store.entries = [e for e in store.entries if e.id != args.entry_id]
+    if len(store.entries) == before:
+        print(f"no saved entry with id '{args.entry_id}'", file=sys.stderr)
+        return 1
+    vault_module.save(store, passphrase, paths.VAULT_PATH)
+    try:
+        ipc.request(ipc.AUTH_SOCKET, "arm", {"passphrase": passphrase}, timeout=5.0)
+    except (OSError, ConnectionError):
+        pass
+    print("removed")
+    return 0
+
+
 def _status(args: argparse.Namespace) -> int:
     try:
         response = ipc.request(ipc.STATUS_SOCKET, "status", timeout=5.0)
@@ -588,6 +835,37 @@ def main(argv: list[str] | None = None) -> int:
     authenticate = subparsers.add_parser("authenticate", help="run one unlock scan (what the PAM module does)")
     authenticate.add_argument("--json", action="store_true")
     authenticate.set_defaults(func=_authenticate)
+
+    autotype = subparsers.add_parser(
+        "autotype",
+        help="face-scan, then type a saved password into the focused window (Hyprland; convenience only, see README)",
+    )
+    passphrase_flags(autotype)
+    # No terminal is expected: this is meant to run from a Hyprland keybind.
+    # Any prompt it needs (a new site password, or the passphrase if it was
+    # never remembered) opens as a window instead of reading stdin.
+    autotype.set_defaults(func=_autotype, gui=True)
+
+    vault = subparsers.add_parser("vault", help="manage saved autotype passwords")
+    vault_sub = vault.add_subparsers(dest="vault_command", required=True)
+
+    vault_add = vault_sub.add_parser("add", help="save a password for a window class")
+    vault_add.add_argument("--class", dest="window_class", required=True, help="window class, e.g. 'firefox'")
+    vault_add.add_argument("--title-hint", default="", help="substring of the window title, to tell apart several saved entries for the same class")
+    vault_add.add_argument("--label", default="", help="a name to show when disambiguating (default: the window class)")
+    vault_add.add_argument("--enter", action="store_true", help="press Enter after typing the password")
+    passphrase_flags(vault_add)
+    vault_add.set_defaults(func=_vault_add)
+
+    vault_list = vault_sub.add_parser("list", help="list saved entries (no secrets shown)")
+    vault_list.add_argument("--json", action="store_true")
+    passphrase_flags(vault_list)
+    vault_list.set_defaults(func=_vault_list)
+
+    vault_remove = vault_sub.add_parser("remove", help="delete a saved entry")
+    vault_remove.add_argument("entry_id")
+    passphrase_flags(vault_remove)
+    vault_remove.set_defaults(func=_vault_remove)
 
     setup_pam = subparsers.add_parser("setup-pam", help="wire pam_glance into the lock screen (uses sudo)")
     setup_pam.add_argument("--hands-free", action="store_true",

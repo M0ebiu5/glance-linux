@@ -12,7 +12,6 @@ from typing import Optional
 
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -137,7 +136,9 @@ def ask(*, confirm: bool, error: str = "") -> Optional[str]:
     # Held at module level on purpose: the sweep window that follows reuses
     # the application instead of starting a second one.
     global _APP
-    _APP = QApplication.instance() or QApplication([])
+    from ._qt import app as _qapp
+
+    _APP = _qapp()
     dialog = PassphraseDialog(confirm=confirm, error=error)
     dialog.show()
     dialog.raise_()
