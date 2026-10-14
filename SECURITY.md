@@ -46,6 +46,13 @@ vulnerability. You will get a reply within a week.
   never landmarks, never an embedding. It is group-readable like the status
   socket, and `--no-attention` removes it.
 
+- **Failed-attempt photos.** A failed face scan and a wrong password on the
+  lock screen leave a JPEG in `~/.local/share/glance/intruders/` (0700/0600).
+  They are not encrypted: anyone who can read your home directory can see
+  them, and code running as you can delete them. The PAM `capture` line is
+  `[default=ignore]` and the module returns `PAM_IGNORE` from it, so it cannot
+  change an authentication result. `--no-intruder-photos` turns them off.
+
 ### What it does not defend against: code running as you
 
 The daemon runs **as your user**, in your session, and the PAM module trusts

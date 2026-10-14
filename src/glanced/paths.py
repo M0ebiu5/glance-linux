@@ -38,6 +38,9 @@ PASSPHRASE_FILE = Path(os.environ.get("GLANCE_PASSPHRASE_FILE") or DATA_DIR / "p
 #: passphrase as the enrollment store. See `vault.py` and `glancectl autotype`.
 VAULT_PATH = Path(os.environ.get("GLANCE_VAULT") or DATA_DIR / "vault.bin")
 
+#: Photos of failed unlock attempts. See `intruder.py`.
+INTRUDER_DIR = Path(os.environ.get("GLANCE_INTRUDER_DIR") or DATA_DIR / "intruders")
+
 LANDMARKER_NAME = "face_landmarker.task"
 ARCFACE_NAME = "arcface.onnx"
 

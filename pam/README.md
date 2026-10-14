@@ -35,6 +35,23 @@ Omarchy has two lock screens, and `setup-pam` handles both:
 `sufficient` means a face success ends the stack; any failure drops through to
 the password (or fingerprint) exactly as before.
 
+On the password stacks `setup-pam` also adds a second line right after
+`pam_unix.so`:
+
+```
+auth       [success=2 default=bad]     pam_unix.so try_first_pass nullok   # was success=1
+auth       [default=ignore]            pam_glance.so capture
+auth       [default=die]               pam_faillock.so authfail ...
+```
+
+Only a wrong password reaches it. It asks the daemon to photograph whoever is
+at the camera and returns `PAM_IGNORE` within two seconds whatever happens.
+Every `success=N` jump that crosses the new line is lengthened by one so a
+right password still lands where it did; `--remove` shortens them again.
+`--no-photos` skips this line. An installed module older than this feature
+is rebuilt first, because an old module ignores `capture` and would run a
+face scan instead.
+
 ### On demand vs hands-free
 
 The default is on demand: the camera only runs when you press Enter. That is
@@ -70,6 +87,7 @@ face unlocks in about two seconds, before you would have finished typing.
 |---|---|
 | `debug` | log why the module declined, to the auth log |
 | `timeout=N` | seconds to wait for the daemon (default 20) |
+| `capture` | ask for a failed-attempt photo instead of a scan; always `PAM_IGNORE` |
 
 ## Build by hand
 

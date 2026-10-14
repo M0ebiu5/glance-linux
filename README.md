@@ -61,6 +61,7 @@ the shell's own lock have, but one you should read before relying on it.
 | Omarchy plugin (`plugin/`) | Bar widget + panel — see `plugin/README.md` |
 | Lock screen indicator (`patches/omarchy-lock-faceid/`) | Face ID-style capsule with a live camera view — a patch to Omarchy's lock plugin, applied by `glancectl setup-lock` and re-applied after `omarchy update` by a post-update hook |
 | Autotype (`glancectl autotype`, `vault.py`) | Complete, tested — optional, convenience only, see below |
+| Failed-attempt photos (`intruder.py`, `glancectl intruders`) | Complete, tested — face and password failures, see below |
 
 ## Install
 
@@ -252,6 +253,40 @@ claim most of the obvious ones.
 
 Not something this project does on its own: editing your compositor config is
 yours to do, and to remove.
+
+## Failed-attempt photos
+
+When the lock screen refuses someone, glance keeps a photo of who was there:
+
+- **A failed face scan** — no enrolled face matched, a spoof was denied, or
+  liveness never confirmed — saves the last frame the scan saw a face in. An
+  empty room (no face at all), a broken camera or a disarmed daemon is not an
+  attempt and is not photographed, the same rule the lockout counter uses.
+- **A wrong password** is photographed too. `glancectl setup-pam` adds
+  `auth [default=ignore] pam_glance.so capture` right after `pam_unix.so` in
+  the password stack; only a wrong password reaches it, since a right one
+  jumps past (setup-pam lengthens the `success=N` jumps it crosses by one, so
+  `pam_faillock` keeps working). The module asks the daemon for a photo and
+  returns at once — it never changes the verdict and never makes the next
+  attempt wait. The daemon then grabs the camera for up to two seconds and
+  keeps the first frame with a face, or the last one if nobody shows.
+  This works whether or not the daemon is armed.
+
+A wrong password within ten seconds of a failed face scan is the same attempt
+(the shell lock forwards the character that triggered the scan to
+`pam_unix`), so it does not earn a second photo.
+
+Photos are full camera frames, unmirrored, in
+`~/.local/share/glance/intruders/` (a 0700 directory, each file 0600, the
+newest 100 kept). `glancectl intruders` lists them, `--clear` deletes them,
+and `glancectl status` shows the count. `glancectl daemon --no-intruder-photos`
+turns photos off entirely; `glancectl setup-pam --no-photos` leaves the
+password line out. A stack that only `include`s another one (stock hyprlock)
+has no `pam_unix.so` line of its own to follow, so there only face failures
+are photographed.
+
+This is the one place glance writes a camera frame to disk rather than to
+tmpfs — that is the point of it, and why it can be switched off.
 
 ## The liveness model
 

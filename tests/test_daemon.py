@@ -29,6 +29,7 @@ def scratch(tmp_path, monkeypatch):
     monkeypatch.setattr(ipc, "AUTH_SOCKET", runtime / "auth.sock")
     monkeypatch.setattr(ipc, "STATUS_SOCKET", runtime / "status.sock")
     monkeypatch.setattr(paths, "PASSPHRASE_FILE", tmp_path / "passphrase")
+    monkeypatch.setattr(paths, "INTRUDER_DIR", tmp_path / "intruders")
     return tmp_path
 
 
@@ -308,3 +309,97 @@ def test_status_reports_vault_entry_count(daemon):
     )
     status = ipc.request(ipc.STATUS_SOCKET, "status").payload
     assert status["vault"] == {"entries": 2}
+
+
+# --- failed-attempt photos ------------------------------------------------
+#
+# A failed face scan keeps the last face it saw; a `capture` request (what
+# pam_glance sends after a wrong password) grabs a fresh frame. Neither may
+# change a verdict, and an empty room is not photographed.
+
+
+def _photo_daemon(scratch, outcomes, **kw):
+    from glanced.pipeline import ScanResult
+
+    instance = _scripted_daemon(scratch, [], intruder_dir=scratch / "intruders", **kw)
+    queue = list(outcomes)
+
+    def scan():
+        outcome = queue.pop(0)
+        if outcome is not Outcome.NO_FACE:
+            instance._face_frame = np.full((48, 64, 3), 128, dtype=np.uint8)
+        return ScanResult(outcome)
+
+    instance._scan = scan  # type: ignore[method-assign]
+    return instance
+
+
+def _photos(scratch):
+    return sorted((scratch / "intruders").glob("*.jpg")) if (scratch / "intruders").exists() else []
+
+
+def test_failed_face_scan_is_photographed(scratch):
+    _enrolled_store(scratch / "enrollment.bin")
+    d = _photo_daemon(scratch, [Outcome.NO_MATCH, Outcome.SPOOF_DENIED])
+    d.run_scan()
+    photos = _photos(scratch)
+    assert len(photos) == 1 and photos[0].name.endswith("-face.jpg")
+    assert photos[0].stat().st_mode & 0o777 == 0o600
+    assert (scratch / "intruders").stat().st_mode & 0o777 == 0o700
+    assert d._status_payload()["intruderPhotos"]["count"] == 1
+
+
+def test_unlock_and_empty_room_are_not_photographed(scratch):
+    _enrolled_store(scratch / "enrollment.bin")
+    d = _photo_daemon(scratch, [Outcome.UNLOCKED, Outcome.NO_FACE])
+    d.run_scan(); d.run_scan()
+    assert _photos(scratch) == []
+
+
+def test_photos_can_be_disabled(scratch):
+    _enrolled_store(scratch / "enrollment.bin")
+    d = _photo_daemon(scratch, [Outcome.NO_MATCH], intruder_photos=False)
+    d.run_scan()
+    assert _photos(scratch) == []
+    response = d._handle_auth(ipc.Request("capture", {"reason": "password"}))
+    assert response.ok and response.payload["captured"] is False
+
+
+def _wait_for_photos(scratch, count):
+    deadline = time.monotonic() + 3
+    while len(_photos(scratch)) < count:
+        assert time.monotonic() < deadline, "no photo was written"
+        time.sleep(0.01)
+
+
+def test_password_failure_capture_grabs_a_frame(scratch):
+    _enrolled_store(scratch / "enrollment.bin")
+    d = _photo_daemon(scratch, [])
+    d._grab_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)  # type: ignore[method-assign]
+    response = d._handle_auth(ipc.Request("capture", {"reason": "password"}))
+    assert response.ok and response.payload["captured"] is True
+    _wait_for_photos(scratch, 1)
+    assert _photos(scratch)[0].name.endswith("-password.jpg")
+
+
+def test_password_failure_right_after_a_face_failure_is_one_photo(scratch):
+    _enrolled_store(scratch / "enrollment.bin")
+    d = _photo_daemon(scratch, [Outcome.NO_MATCH])
+    d._grab_frame = lambda: np.zeros((48, 64, 3), dtype=np.uint8)  # type: ignore[method-assign]
+    d.run_scan()
+    response = d._handle_auth(ipc.Request("capture", {"reason": "password"}))
+    assert response.payload["captured"] is False
+    assert len(_photos(scratch)) == 1
+
+
+def test_capture_works_disarmed_and_never_scans(daemon, scratch, monkeypatch):
+    monkeypatch.setattr(daemon, "intruder_dir", scratch / "intruders")
+    monkeypatch.setattr(daemon, "_grab_frame", lambda: np.zeros((48, 64, 3), dtype=np.uint8))
+    response = ipc.request(ipc.AUTH_SOCKET, "capture", {"reason": "password"})
+    assert response.ok and response.payload["captured"] is True
+    _wait_for_photos(scratch, 1)
+    assert daemon.last_scan is None
+
+
+def test_status_socket_cannot_capture(daemon):
+    assert not ipc.request(ipc.STATUS_SOCKET, "capture").ok

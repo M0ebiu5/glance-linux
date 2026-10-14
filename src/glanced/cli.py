@@ -603,6 +603,13 @@ def _status(args: argparse.Namespace) -> int:
             else:
                 lock = "not wired (glancectl setup-pam)"
             print(f"lock screen: {lock}")
+        photos = p.get("intruderPhotos")
+        if photos:
+            if not photos["enabled"]:
+                state = "off (--no-intruder-photos)"
+            else:
+                state = "face" + (" + password" if pam and pam.get("photos") else " only (glancectl setup-pam for password)")
+            print(f"photos:     {state}, {photos['count']} saved" + (f", latest {photos['latest']}" if photos["latest"] else ""))
         indicator = p.get("lock")
         if indicator and indicator.get("available"):
             if indicator["patched"]:
@@ -630,11 +637,30 @@ def _setup_pam(args: argparse.Namespace) -> int:
         return pamsetup.setup(
             hands_free=args.hands_free,
             remove=args.remove,
+            photos=not args.no_photos,
             repo_pam_dir=repo_pam if repo_pam.exists() else None,
         )
     except subprocess.CalledProcessError as error:
         print(f"setup-pam: command failed: {' '.join(map(str, error.cmd))}", file=sys.stderr)
         return 1
+
+
+def _intruders(args: argparse.Namespace) -> int:
+    from . import intruder
+
+    if args.clear:
+        removed = intruder.clear()
+        print(f"deleted {removed} photo(s) from {paths.INTRUDER_DIR}")
+        return 0
+    existing = intruder.photos()
+    if args.json:
+        print(json.dumps([str(p) for p in existing]))
+    elif not existing:
+        print(f"no failed-attempt photos in {paths.INTRUDER_DIR}")
+    else:
+        for photo in existing:
+            print(photo)
+    return 0
 
 
 def _setup_lock(args: argparse.Namespace) -> int:
@@ -767,6 +793,7 @@ def _daemon(args: argparse.Namespace) -> int:
         lockout_seconds=args.lockout,
         attention=not args.no_attention,
         attention_fps=args.attention_fps,
+        intruder_photos=not args.no_intruder_photos,
     )
     if daemon.arm_from_file():
         logging.info("armed from remembered passphrase")
@@ -871,6 +898,8 @@ def main(argv: list[str] | None = None) -> int:
     setup_pam.add_argument("--hands-free", action="store_true",
                            help="scan automatically at lock via the shell's fingerprint stack (needs an enrolled fingerprint)")
     setup_pam.add_argument("--remove", action="store_true", help="strip pam_glance from every lock stack")
+    setup_pam.add_argument("--no-photos", action="store_true",
+                           help="do not photograph failed password attempts (face failures are the daemon's --no-intruder-photos)")
     setup_pam.set_defaults(func=_setup_pam)
 
     setup_lock = subparsers.add_parser(
@@ -878,6 +907,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     setup_lock.add_argument("--remove", action="store_true", help="restore the stock lock screen files")
     setup_lock.set_defaults(func=_setup_lock)
+
+    intruders = subparsers.add_parser("intruders", help="list the photos taken of failed unlock attempts")
+    intruders.add_argument("--clear", action="store_true", help="delete them all")
+    intruders.add_argument("--json", action="store_true")
+    intruders.set_defaults(func=_intruders)
 
     status = subparsers.add_parser("status", help="query the running daemon")
     status.add_argument("--json", action="store_true")
@@ -922,6 +956,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="landmarker rate while an attention subscriber is connected")
     daemon.add_argument("--lockout", type=float, default=300.0,
                         help="seconds face unlock stays off after that many failures")
+    daemon.add_argument("--no-intruder-photos", action="store_true",
+                        help="never save a photo of a failed unlock attempt (see intruder.py)")
     daemon.set_defaults(func=_daemon)
 
     args = parser.parse_args(argv)

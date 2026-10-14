@@ -17,6 +17,12 @@
  *   - refuses if the socket is not owned by that same uid.
  *
  * Use it only in the lock screen's PAM service. See pam/README.md.
+ *
+ * With the `capture` argument the module asks for something else: a photo of
+ * whoever is at the camera, because the password just failed. That line sits
+ * after pam_unix.so with control [default=ignore]; it returns PAM_IGNORE
+ * whatever happens and never waits on the camera, so it cannot change the
+ * verdict or slow down the next attempt.
  */
 
 #define PAM_SM_AUTH
@@ -37,6 +43,8 @@
 #include <security/pam_modules.h>
 
 #define REQUEST "{\"verb\": \"authenticate\", \"payload\": {}}\n"
+#define CAPTURE_REQUEST "{\"verb\": \"capture\", \"payload\": {\"reason\": \"password\"}}\n"
+#define CAPTURE_TIMEOUT_SECONDS 2
 #define OK_PREFIX "{\"ok\": true"
 #define DEFAULT_TIMEOUT_SECONDS 20
 
@@ -64,10 +72,17 @@ static int read_line(int fd, char *buffer, size_t size) {
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv) {
     (void)flags;
     int debug = 0;
+    int capture = 0;
     int timeout = DEFAULT_TIMEOUT_SECONDS;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "debug") == 0) debug = 1;
+        else if (strcmp(argv[i], "capture") == 0) capture = 1;
         else if (strncmp(argv[i], "timeout=", 8) == 0) timeout = atoi(argv[i] + 8);
+    }
+    if (capture) {
+        /* The daemon answers before it touches the camera; anything slower
+         * than this means it is wedged, and a failed password must not wait. */
+        timeout = CAPTURE_TIMEOUT_SECONDS;
     }
 
     const char *user = NULL;
@@ -111,9 +126,9 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
         return PAM_AUTHINFO_UNAVAIL;
     }
 
-    pam_info(pamh, "Glance: look at the camera");
+    if (!capture) pam_info(pamh, "Glance: look at the camera");
 
-    const char *request = REQUEST;
+    const char *request = capture ? CAPTURE_REQUEST : REQUEST;
     size_t remaining = strlen(request);
     while (remaining > 0) {
         ssize_t sent = write(fd, request, remaining);
@@ -129,6 +144,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, cons
     char response[4096];
     int got = read_line(fd, response, sizeof response);
     close(fd);
+    if (capture) {
+        if (debug) pam_syslog(pamh, LOG_NOTICE, "capture: %.200s", got > 0 ? response : "no response");
+        return PAM_IGNORE;
+    }
     if (got <= 0) {
         if (debug) pam_syslog(pamh, LOG_NOTICE, "no response from daemon");
         return PAM_AUTHINFO_UNAVAIL;

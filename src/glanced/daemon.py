@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import ipc, locksetup, models, pamsetup, paths
+from . import intruder, ipc, locksetup, models, pamsetup, paths
 from .attention import DEFAULT_FPS, AttentionTracker, DisabledTracker
 from .preview import PreviewWriter
 from .liveness import LivenessMode
@@ -48,6 +48,19 @@ DEFAULT_LOCKOUT_SECONDS = 300.0
 
 #: Outcomes that count as a failed attempt by someone who was there.
 _FAILED_ATTEMPT = frozenset({Outcome.NO_MATCH, Outcome.SPOOF_DENIED, Outcome.TIMED_OUT})
+
+#: A failed password right after a failed face scan is usually the same
+#: attempt — the shell lock sends the one character that triggered the scan
+#: on to `pam_unix` — so it does not earn a second photo this soon.
+CAPTURE_DEDUPE_SECONDS = 10.0
+
+#: Frames to throw away before a password-failure photo, while the camera's
+#: auto-exposure settles; the first frames off a UVC webcam are dark.
+CAPTURE_WARMUP_FRAMES = 10
+
+#: How long a password-failure capture looks for a face before settling for
+#: whatever the camera sees.
+CAPTURE_FACE_SECONDS = 2.0
 
 
 @dataclass
@@ -103,6 +116,8 @@ class Daemon:
         attention_fps: float = DEFAULT_FPS,
         landmarker_factory: Optional[Callable[[], Any]] = None,
         camera_factory: Optional[Callable[[str], Any]] = None,
+        intruder_photos: bool = True,
+        intruder_dir: Optional[Path] = None,
     ) -> None:
         self.mode = mode
         self.device = device
@@ -125,6 +140,12 @@ class Daemon:
         self.lockout_seconds = lockout_seconds
         self.failures = 0
         self._locked_until = 0.0
+        # Photos of failed attempts; see intruder.py. `_face_frame` is the last
+        # frame with a face in it from the scan in progress.
+        self.intruder_photos = intruder_photos
+        self.intruder_dir = intruder_dir
+        self._face_frame: Optional[Any] = None
+        self._last_photo_at = float("-inf")
         self._processor = None
         self._processor_factory = processor_factory or self._default_processor
         # Head pose for the desktop. Separate landmarker, separate socket,
@@ -278,6 +299,9 @@ class Daemon:
         if request.verb == "autotype":
             return self._autotype(request.payload)
 
+        if request.verb == "capture":
+            return self._capture(request.payload)
+
         return ipc.Response(False, {"error": "unsupported verb"})
 
     def _autotype(self, payload: dict[str, Any]) -> ipc.Response:
@@ -316,6 +340,63 @@ class Daemon:
             True, {"found": True, "secret": entry.secret, "sendEnter": entry.send_enter, "label": entry.label}
         )
 
+    def _capture(self, payload: dict[str, Any]) -> ipc.Response:
+        """A password just failed on the lock screen: photograph whoever is there.
+
+        Answered at once and done in the background, so the PAM conversation
+        that asked never waits on the camera. Works disarmed too — a photo
+        needs no identities, and a disarmed daemon is exactly when someone
+        else might be typing."""
+        if not self.intruder_photos:
+            return ipc.Response(True, {"captured": False, "reason": "disabled"})
+        if time.monotonic() - self._last_photo_at < CAPTURE_DEDUPE_SECONDS:
+            return ipc.Response(True, {"captured": False, "reason": "already photographed"})
+        reason = payload.get("reason") if isinstance(payload.get("reason"), str) else "password"
+        self._last_photo_at = time.monotonic()  # claim it now; a second request must not race us
+        threading.Thread(target=self._capture_now, args=(reason,), daemon=True).start()
+        return ipc.Response(True, {"captured": True})
+
+    def _capture_now(self, reason: str) -> None:
+        try:
+            with self._lock, self.attention.paused():
+                frame = self._grab_frame()
+            if frame is None:
+                log.warning("no frame for a %s-failure photo", reason)
+                return
+            self._save_photo(frame, reason)
+        except Exception:
+            log.exception("could not take a %s-failure photo", reason)
+
+    def _grab_frame(self):
+        """One frame for a password-failure photo: the first with a face in
+        it within `CAPTURE_FACE_SECONDS`, else the last one seen."""
+        from .camera import Camera, CameraConfig
+
+        try:
+            processor = self._get_processor()
+        except Exception:
+            processor = None  # no models: still worth a photo, just not a face-seeking one
+        frame = None
+        with Camera(CameraConfig(device=self.device)) as camera:
+            started = time.monotonic()
+            for count, frame in enumerate(camera.frames()):
+                if count < CAPTURE_WARMUP_FRAMES:
+                    continue
+                now = time.monotonic()
+                if now - started > CAPTURE_FACE_SECONDS or processor is None:
+                    break
+                try:
+                    if processor.process(frame, now, want_embedding=False) is not None:
+                        break
+                except Exception:
+                    break
+        return frame
+
+    def _save_photo(self, frame, reason: str) -> None:
+        self._last_photo_at = time.monotonic()
+        path = intruder.save(frame, reason, directory=self.intruder_dir)
+        log.warning("failed %s attempt: photo saved to %s", reason, path)
+
     def _handle_status(self, request: ipc.Request) -> ipc.Response:
         """Presentation only. Nothing here can cause or influence an unlock."""
         if request.verb != "status":
@@ -344,6 +425,15 @@ class Daemon:
             ],
             "lastScan": self.last_scan,
             "vault": {"entries": len(self.vault.entries)},
+            "intruderPhotos": self._intruder_status(),
+        }
+
+    def _intruder_status(self) -> dict[str, Any]:
+        existing = intruder.photos(self.intruder_dir)
+        return {
+            "enabled": self.intruder_photos,
+            "count": len(existing),
+            "latest": str(existing[-1]) if existing else None,
         }
 
     # --- the scan -----------------------------------------------------------
@@ -371,6 +461,7 @@ class Daemon:
             )
         else:
             self.scanning = True
+            self._face_frame = None
             try:
                 # Attention hands the camera over for the scan and takes it
                 # back afterwards; an auth request always has priority.
@@ -382,12 +473,25 @@ class Daemon:
             finally:
                 self.scanning = False
             self._count(result)
+            if result.outcome in _FAILED_ATTEMPT:
+                self._photograph_failure(result)
 
         self.last_scan = {**_describe(result), "at": time.time(), "duration": round(time.monotonic() - started, 2)}
         log.info("scan: %s%s", result.outcome.value, f" ({result.reason})" if result.reason else "")
         if result.outcome is Outcome.UNLOCKED:
             self.session.touch()
         return result
+
+    def _photograph_failure(self, result: ScanResult) -> None:
+        """Keep the last face the failed scan saw. Never raises: a photo that
+        cannot be written must not change the verdict."""
+        frame, self._face_frame = self._face_frame, None
+        if not self.intruder_photos or frame is None:
+            return
+        try:
+            self._save_photo(frame, "face")
+        except Exception:
+            log.exception("could not save a face-failure photo (%s)", result.outcome.value)
 
     def locked_out_for(self) -> float:
         """Seconds until the daemon will scan again; 0 when it will now."""
@@ -438,6 +542,7 @@ class Daemon:
                             return expired
                         continue
                     saw_face = True
+                    self._face_frame = native
                     result = pipeline.observe(observation.liveness_frame, observation.embedding)
                     if result.outcome is not Outcome.PENDING:
                         return result
